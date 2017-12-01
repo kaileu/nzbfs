@@ -13,7 +13,7 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-from __future__ import division
+from __future__ import print_function, absolute_import, division
 
 from ctypes import *
 from ctypes.util import find_library
@@ -155,6 +155,44 @@ elif _system == 'Linux':
             ('st_atimespec', c_timespec),
             ('st_mtimespec', c_timespec),
             ('st_ctimespec', c_timespec)]
+    elif _machine == 'mips':
+        c_stat._fields_ = [
+            ('st_dev', c_dev_t),
+            ('__pad1_1', c_ulong),
+            ('__pad1_2', c_ulong),
+            ('__pad1_3', c_ulong),
+            ('st_ino', c_ulong),
+            ('st_mode', c_mode_t),
+            ('st_nlink', c_ulong),
+            ('st_uid', c_uid_t),
+            ('st_gid', c_gid_t),
+            ('st_rdev', c_dev_t),
+            ('__pad2_1', c_ulong),
+            ('__pad2_2', c_ulong),
+            ('st_size', c_off_t),
+            ('__pad3', c_ulong),
+            ('st_atimespec', c_timespec),
+            ('__pad4', c_ulong),
+            ('st_mtimespec', c_timespec),
+            ('__pad5', c_ulong),
+            ('st_ctimespec', c_timespec),
+            ('__pad6', c_ulong),
+            ('st_blksize', c_long),
+            ('st_blocks', c_long),
+            ('__pad7_1', c_ulong),
+            ('__pad7_2', c_ulong),
+            ('__pad7_3', c_ulong),
+            ('__pad7_4', c_ulong),
+            ('__pad7_5', c_ulong),
+            ('__pad7_6', c_ulong),
+            ('__pad7_7', c_ulong),
+            ('__pad7_8', c_ulong),
+            ('__pad7_9', c_ulong),
+            ('__pad7_10', c_ulong),
+            ('__pad7_11', c_ulong),
+            ('__pad7_12', c_ulong),
+            ('__pad7_13', c_ulong),
+            ('__pad7_14', c_ulong)]
     elif _machine == 'ppc':
         c_stat._fields_ = [
             ('st_dev', c_dev_t),
@@ -168,6 +206,23 @@ elif _system == 'Linux':
             ('st_size', c_off_t),
             ('st_blksize', c_long),
             ('st_blocks', c_longlong),
+            ('st_atimespec', c_timespec),
+            ('st_mtimespec', c_timespec),
+            ('st_ctimespec', c_timespec)]
+    elif _machine == 'aarch64':
+        c_stat._fields_ = [
+            ('st_dev', c_dev_t),
+            ('st_ino', c_ulong),
+            ('st_mode', c_mode_t),
+            ('st_nlink', c_uint),
+            ('st_uid', c_uid_t),
+            ('st_gid', c_gid_t),
+            ('st_rdev', c_dev_t),
+            ('__pad1', c_ulong),
+            ('st_size', c_off_t),
+            ('st_blksize', c_int),
+            ('__pad2', c_int),
+            ('st_blocks', c_long),
             ('st_atimespec', c_timespec),
             ('st_mtimespec', c_timespec),
             ('st_ctimespec', c_timespec)]
@@ -203,7 +258,11 @@ class c_statvfs(Structure):
         ('f_bavail', c_fsblkcnt_t),
         ('f_files', c_fsfilcnt_t),
         ('f_ffree', c_fsfilcnt_t),
-        ('f_favail', c_fsfilcnt_t)]
+        ('f_favail', c_fsfilcnt_t),
+        ('f_fsid', c_ulong),
+        #('unused', c_int),
+        ('f_flag', c_ulong),
+        ('f_namemax', c_ulong)]
 
 if _system == 'FreeBSD':
     c_fsblkcnt_t = c_uint64
@@ -311,6 +370,10 @@ class fuse_operations(Structure):
 
         ('utimens', CFUNCTYPE(c_int, c_char_p, POINTER(c_utimbuf))),
         ('bmap', CFUNCTYPE(c_int, c_char_p, c_size_t, POINTER(c_ulonglong))),
+        ('flag_nullpath_ok', c_uint, 1),
+        ('flag_nopath', c_uint, 1),
+        ('flag_utime_omit_ok', c_uint, 1),
+        ('flag_reserved', c_uint, 29),
     ]
 
 
@@ -319,8 +382,10 @@ def time_of_timespec(ts):
 
 def set_st_attrs(st, attrs):
     for key, val in attrs.items():
-        if key in ('st_atime', 'st_mtime', 'st_ctime'):
-            timespec = getattr(st, key + 'spec')
+        if key in ('st_atime', 'st_mtime', 'st_ctime', 'st_birthtime'):
+            timespec = getattr(st, key + 'spec', None)
+            if timespec is None:
+                continue
             timespec.tv_sec = int(val)
             timespec.tv_nsec = int((val - timespec.tv_sec) * 10 ** 9)
         elif hasattr(st, key):
@@ -328,7 +393,8 @@ def set_st_attrs(st, attrs):
 
 
 def fuse_get_context():
-    """Returns a (uid, gid, pid) tuple"""
+    'Returns a (uid, gid, pid) tuple'
+
     ctxp = _libfuse.fuse_get_context()
     ctx = ctxp.contents
     return ctx.uid, ctx.gid, ctx.pid
@@ -340,28 +406,38 @@ class FuseOSError(OSError):
 
 
 class FUSE(object):
-    """This class is the lower level interface and should not be subclassed
-       under normal use. Its methods are called by fuse.
-       Assumes API version 2.6 or later."""
+    '''
+    This class is the lower level interface and should not be subclassed under
+    normal use. Its methods are called by fuse.
+
+    Assumes API version 2.6 or later.
+    '''
+
+    OPTIONS = (
+        ('foreground', '-f'),
+        ('debug', '-d'),
+        ('nothreads', '-s'),
+    )
 
     def __init__(self, operations, mountpoint, raw_fi=False, encoding='utf-8',
                  **kwargs):
 
-        """Setting raw_fi to True will cause FUSE to pass the fuse_file_info
-           class as is to Operations, instead of just the fh field.
-           This gives you access to direct_io, keep_cache, etc."""
+        '''
+        Setting raw_fi to True will cause FUSE to pass the fuse_file_info
+        class as is to Operations, instead of just the fh field.
+
+        This gives you access to direct_io, keep_cache, etc.
+        '''
 
         self.operations = operations
         self.raw_fi = raw_fi
         self.encoding = encoding
 
         args = ['fuse']
-        if kwargs.pop('foreground', False):
-            args.append('-f')
-        if kwargs.pop('debug', False):
-            args.append('-d')
-        if kwargs.pop('nothreads', False):
-            args.append('-s')
+
+        args.extend(flag for arg, flag in self.OPTIONS
+                    if kwargs.pop(arg, False))
+
         kwargs.setdefault('fsname', operations.__class__.__name__)
         args.append('-o')
         args.append(','.join(self._normalize_fuse_options(**kwargs)))
@@ -371,17 +447,33 @@ class FUSE(object):
         argv = (c_char_p * len(args))(*args)
 
         fuse_ops = fuse_operations()
-        for name, prototype in fuse_operations._fields_:
-            if prototype != c_voidp and getattr(operations, name, None):
-                op = partial(self._wrapper, getattr(self, name))
-                setattr(fuse_ops, name, prototype(op))
+        for ent in fuse_operations._fields_:
+            name, prototype = ent[:2]
 
-        old_handler = signal(SIGINT, SIG_DFL)
+            val = getattr(operations, name, None)
+            if val is None:
+                continue
+
+            # Function pointer members are tested for using the
+            # getattr(operations, name) above but are dynamically
+            # invoked using self.operations(name)
+            if hasattr(prototype, 'argtypes'):
+                val = prototype(partial(self._wrapper, getattr(self, name)))
+
+            setattr(fuse_ops, name, val)
+
+        try:
+            old_handler = signal(SIGINT, SIG_DFL)
+        except ValueError:
+            old_handler = SIG_DFL
 
         err = _libfuse.fuse_main_real(len(args), argv, pointer(fuse_ops),
                                       sizeof(fuse_ops), None)
 
-        signal(SIGINT, old_handler)
+        try:
+            signal(SIGINT, old_handler)
+        except ValueError:
+            pass
 
         del self.operations     # Invoke the destructor
         if err:
@@ -397,14 +489,23 @@ class FUSE(object):
 
     @staticmethod
     def _wrapper(func, *args, **kwargs):
-        """Decorator for the methods that follow"""
+        'Decorator for the methods that follow'
+
         try:
             return func(*args, **kwargs) or 0
-        except OSError, e:
+        except OSError as e:
             return -(e.errno or EFAULT)
         except:
             print_exc()
             return -EFAULT
+
+    def _decode_optional_path(self, path):
+        # NB: this method is intended for fuse operations that
+        #     allow the path argument to be NULL,
+        #     *not* as a generic path decoding method
+        if path is None:
+            return None
+        return path.decode(self.encoding)
 
     def getattr(self, path, buf):
         return self.fgetattr(path, buf, None)
@@ -432,6 +533,8 @@ class FUSE(object):
         return self.operations('rmdir', path.decode(self.encoding))
 
     def symlink(self, source, target):
+        'creates a symlink `target -> source` (e.g. ln -s source target)'
+
         return self.operations('symlink', target.decode(self.encoding),
                                           source.decode(self.encoding))
 
@@ -440,6 +543,8 @@ class FUSE(object):
                                          new.decode(self.encoding))
 
     def link(self, source, target):
+        'creates a hard link `target -> source` (e.g. ln source target)'
+
         return self.operations('link', target.decode(self.encoding),
                                        source.decode(self.encoding))
 
@@ -474,7 +579,7 @@ class FUSE(object):
         else:
           fh = fip.contents.fh
 
-        ret = self.operations('read', path.decode(self.encoding), size,
+        ret = self.operations('read', self._decode_optional_path(path), size,
                                       offset, fh)
 
         if not ret: return 0
@@ -484,7 +589,7 @@ class FUSE(object):
             'actual amount read %d greater than expected %d' % (retsize, size)
 
         data = create_string_buffer(ret, retsize)
-        memmove(buf, ret, retsize)
+        memmove(buf, data, retsize)
         return retsize
 
     def write(self, path, buf, size, offset, fip):
@@ -495,7 +600,7 @@ class FUSE(object):
         else:
             fh = fip.contents.fh
 
-        return self.operations('write', path.decode(self.encoding), data,
+        return self.operations('write', self._decode_optional_path(path), data,
                                         offset, fh)
 
     def statfs(self, path, buf):
@@ -513,7 +618,7 @@ class FUSE(object):
         else:
             fh = fip.contents.fh
 
-        return self.operations('flush', path.decode(self.encoding), fh)
+        return self.operations('flush', self._decode_optional_path(path), fh)
 
     def release(self, path, fip):
         if self.raw_fi:
@@ -521,7 +626,7 @@ class FUSE(object):
         else:
           fh = fip.contents.fh
 
-        return self.operations('release', path.decode(self.encoding), fh)
+        return self.operations('release', self._decode_optional_path(path), fh)
 
     def fsync(self, path, datasync, fip):
         if self.raw_fi:
@@ -529,7 +634,7 @@ class FUSE(object):
         else:
             fh = fip.contents.fh
 
-        return self.operations('fsync', path.decode(self.encoding), datasync,
+        return self.operations('fsync', self._decode_optional_path(path), datasync,
                                         fh)
 
     def setxattr(self, path, name, value, size, options, *args):
@@ -555,7 +660,9 @@ class FUSE(object):
 
     def listxattr(self, path, namebuf, size):
         attrs = self.operations('listxattr', path.decode(self.encoding)) or ''
-        ret = '\x00'.join(attrs).encode(self.encoding) + '\x00'
+        ret = '\x00'.join(attrs).encode(self.encoding)
+        if len(ret) > 0:
+            ret += '\x00'.encode(self.encoding)
 
         retsize = len(ret)
         # allow size queries
@@ -582,7 +689,7 @@ class FUSE(object):
 
     def readdir(self, path, buf, filler, offset, fip):
         # Ignore raw_fi
-        for item in self.operations('readdir', path.decode(self.encoding),
+        for item in self.operations('readdir', self._decode_optional_path(path),
                                                fip.contents.fh):
 
             if isinstance(item, basestring):
@@ -602,12 +709,12 @@ class FUSE(object):
 
     def releasedir(self, path, fip):
         # Ignore raw_fi
-        return self.operations('releasedir', path.decode(self.encoding),
+        return self.operations('releasedir', self._decode_optional_path(path),
                                              fip.contents.fh)
 
     def fsyncdir(self, path, datasync, fip):
         # Ignore raw_fi
-        return self.operations('fsyncdir', path.decode(self.encoding),
+        return self.operations('fsyncdir', self._decode_optional_path(path),
                                            datasync, fip.contents.fh)
 
     def init(self, conn):
@@ -635,7 +742,7 @@ class FUSE(object):
         else:
             fh = fip.contents.fh
 
-        return self.operations('truncate', path.decode(self.encoding),
+        return self.operations('truncate', self._decode_optional_path(path),
                                            length, fh)
 
     def fgetattr(self, path, buf, fip):
@@ -649,7 +756,7 @@ class FUSE(object):
         else:
             fh = fip.contents.fh
 
-        attrs = self.operations('getattr', path.decode(self.encoding), fh)
+        attrs = self.operations('getattr', self._decode_optional_path(path), fh)
         set_st_attrs(st, attrs)
         return 0
 
@@ -659,7 +766,7 @@ class FUSE(object):
         else:
             fh = fip.contents.fh
 
-        return self.operations('lock', path.decode(self.encoding), fh, cmd,
+        return self.operations('lock', self._decode_optional_path(path), fh, cmd,
                                        lock)
 
     def utimens(self, path, buf):
@@ -678,12 +785,14 @@ class FUSE(object):
 
 
 class Operations(object):
-    """This class should be subclassed and passed as an argument to FUSE on
-       initialization. All operations should raise a FuseOSError exception
-       on error.
+    '''
+    This class should be subclassed and passed as an argument to FUSE on
+    initialization. All operations should raise a FuseOSError exception on
+    error.
 
-       When in doubt of what an operation should do, check the FUSE header
-       file or the corresponding system call man page."""
+    When in doubt of what an operation should do, check the FUSE header file
+    or the corresponding system call man page.
+    '''
 
     def __call__(self, op, *args):
         if not hasattr(self, op):
@@ -702,15 +811,19 @@ class Operations(object):
         raise FuseOSError(EROFS)
 
     def create(self, path, mode, fi=None):
-        """When raw_fi is False (default case), fi is None and create should
-           return a numerical file handle.
+        '''
+        When raw_fi is False (default case), fi is None and create should
+        return a numerical file handle.
 
-           When raw_fi is True the file handle should be set directly by
-           create and return 0."""
+        When raw_fi is True the file handle should be set directly by create
+        and return 0.
+        '''
+
         raise FuseOSError(EROFS)
 
     def destroy(self, path):
-        """Called on filesystem destruction. Path is always /"""
+        'Called on filesystem destruction. Path is always /'
+
         pass
 
     def flush(self, path, fh):
@@ -723,31 +836,36 @@ class Operations(object):
         return 0
 
     def getattr(self, path, fh=None):
-        """Returns a dictionary with keys identical to the stat C structure
-           of stat(2).
+        '''
+        Returns a dictionary with keys identical to the stat C structure of
+        stat(2).
 
-           st_atime, st_mtime and st_ctime should be floats.
+        st_atime, st_mtime and st_ctime should be floats.
 
-           NOTE: There is an incombatibility between Linux and Mac OS X
-           concerning st_nlink of directories. Mac OS X counts all files
-           inside the directory, while Linux counts only the
-           subdirectories."""
+        NOTE: There is an incombatibility between Linux and Mac OS X
+        concerning st_nlink of directories. Mac OS X counts all files inside
+        the directory, while Linux counts only the subdirectories.
+        '''
 
         if path != '/':
             raise FuseOSError(ENOENT)
-        return dict(st_mode=(S_IFDIR | 0755), st_nlink=2)
+        return dict(st_mode=(S_IFDIR | 0o755), st_nlink=2)
 
     def getxattr(self, path, name, position=0):
         raise FuseOSError(ENOTSUP)
 
     def init(self, path):
-        """Called on filesystem initialization. (Path is always /)
+        '''
+        Called on filesystem initialization. (Path is always /)
 
-           Use it instead of __init__ if you start threads on
-           initialization."""
+        Use it instead of __init__ if you start threads on initialization.
+        '''
+
         pass
 
     def link(self, target, source):
+        'creates a hard link `target -> source` (e.g. ln source target)'
+
         raise FuseOSError(EROFS)
 
     def listxattr(self, path):
@@ -762,26 +880,34 @@ class Operations(object):
         raise FuseOSError(EROFS)
 
     def open(self, path, flags):
-        """When raw_fi is False (default case), open should return a
-           numerical file handle.
+        '''
+        When raw_fi is False (default case), open should return a numerical
+        file handle.
 
-           When raw_fi is True the signature of open becomes:
-               open(self, path, fi)
+        When raw_fi is True the signature of open becomes:
+            open(self, path, fi)
 
-           and the file handle should be set directly."""
+        and the file handle should be set directly.
+        '''
+
         return 0
 
     def opendir(self, path):
-        """Returns a numerical file handle."""
+        'Returns a numerical file handle.'
+
         return 0
 
     def read(self, path, size, offset, fh):
-        """Returns a string containing the data requested."""
+        'Returns a string containing the data requested.'
+
         raise FuseOSError(EIO)
 
     def readdir(self, path, fh):
-        """Can return either a list of names, or a list of
-           (name, attrs, offset) tuples. attrs is a dict as in getattr."""
+        '''
+        Can return either a list of names, or a list of (name, attrs, offset)
+        tuples. attrs is a dict as in getattr.
+        '''
+
         return ['.', '..']
 
     def readlink(self, path):
@@ -806,14 +932,19 @@ class Operations(object):
         raise FuseOSError(ENOTSUP)
 
     def statfs(self, path):
-        """Returns a dictionary with keys identical to the statvfs C
-           structure of statvfs(3).
+        '''
+        Returns a dictionary with keys identical to the statvfs C structure of
+        statvfs(3).
 
-           On Mac OS X f_bsize and f_frsize must be a power of 2
-           (minimum 512)."""
+        On Mac OS X f_bsize and f_frsize must be a power of 2
+        (minimum 512).
+        '''
+
         return {}
 
     def symlink(self, target, source):
+        'creates a symlink `target -> source` (e.g. ln -s source target)'
+
         raise FuseOSError(EROFS)
 
     def truncate(self, path, length, fh=None):
@@ -823,7 +954,8 @@ class Operations(object):
         raise FuseOSError(EROFS)
 
     def utimens(self, path, times=None):
-        """Times is a (atime, mtime) tuple. If None use current time."""
+        'Times is a (atime, mtime) tuple. If None use current time.'
+
         return 0
 
     def write(self, path, data, offset, fh):
@@ -839,7 +971,7 @@ class LoggingMixIn:
         try:
             ret = getattr(self, op)(path, *args)
             return ret
-        except OSError, e:
+        except OSError as e:
             ret = str(e)
             raise
         finally:
